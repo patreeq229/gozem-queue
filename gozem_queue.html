@@ -431,6 +431,38 @@
 
 <script>
 const SUPERVISOR_PIN = '1981';
+// ============ API SYNC ============
+async function apiAction(payload) {
+  try {
+    await fetch('/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch(e) { toast('❌ Erreur réseau'); }
+}
+
+function startSSE() {
+  const es = new EventSource('/events');
+  es.addEventListener('state', e => {
+    const s = JSON.parse(e.data);
+    state.queue      = s.queue      || [];
+    state.serving    = s.serving    || [];
+    state.done       = s.done       || [];
+    state.financing  = s.financing  || [];
+    state.ticketCounter = s.ticketCounter || 0;
+    // sync agentStatus & agentTime
+    Object.assign(agentStatus, s.agentStatus || {});
+    Object.assign(agentTime,   s.agentTime   || {});
+    render();
+  });
+  es.onerror = () => {
+    setTimeout(startSSE, 3000); // reconnect
+    es.close();
+  };
+}
+
+
 
 function showPinModal() {
   ['pin1','pin2','pin3','pin4'].forEach(id => document.getElementById(id).value = '');
@@ -551,6 +583,7 @@ function login(role) {
   document.getElementById('topbarRole').textContent = '— ' + (role === 'accueil' ? 'Accueil' : role === 'superviseur' ? 'Superviseur' : role);
   startClock();
   if (role === 'superviseur') startRapportScheduler();
+  startSSE();
   render();
 }
 
@@ -564,7 +597,7 @@ function loginAgent() {
   closeOverlay('agentLoginOverlay');
   state.agentName = sel;
   state.role = 'agent';
-  agentLogin(sel);
+  apiAction({ type: 'AGENT_LOGIN', agentName: sel });
   document.getElementById('loginPage').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   buildTabs();
@@ -699,17 +732,12 @@ function callNext(ticketId) {
   const myActive = state.serving.find(t => t.agent === state.agentName);
   if (myActive) { toast('Clôturez votre cas en cours d\'abord'); return; }
 
-  let idx = ticketId
-    ? state.queue.findIndex(t => t.id === ticketId)
-    : state.queue.findIndex(t => canHandle(state.agentName, t.motif));
-  if (idx === -1) { toast('Aucun cas disponible pour vous'); return; }
-  const ticket = state.queue.splice(idx, 1)[0];
-  ticket.status = 'serving';
-  ticket.agent = state.agentName;
-  ticket.startServeTime = Date.now();
-  state.serving.push(ticket);
-  toast('Vous prenez en charge ' + ticket.fullName);
-  render();
+  const available = ticketId
+    ? state.queue.find(t => t.id === ticketId)
+    : state.queue.find(t => canHandle(state.agentName, t.motif));
+  if (!available) { toast('Aucun cas disponible pour vous'); return; }
+  toast('Vous prenez en charge ' + available.fullName);
+  apiAction({ type: 'CALL_NEXT', agentName: state.agentName, ticketId: available.id });
 }
 
 function canHandle(agentName, motif) {
@@ -731,15 +759,11 @@ function openCloseModal(ticketId) {
 function confirmClose() {
   const ticket = state.serving.find(t => t.id === state.closeTarget);
   if (!ticket) return;
-  ticket.status = 'done';
-  ticket.endTime = Date.now();
-  ticket.note = document.getElementById('closeNote').value;
-  state.serving = state.serving.filter(t => t.id !== state.closeTarget);
-  state.done.unshift(ticket);
+  const note = document.getElementById('closeNote').value;
   closeOverlay('closeModal');
   toast('Cas clôturé — ' + ticket.fullName);
+  apiAction({ type: 'CLOSE', ticketId: state.closeTarget, note });
   state.closeTarget = null;
-  render();
 }
 
 // ============ HELPERS ============
