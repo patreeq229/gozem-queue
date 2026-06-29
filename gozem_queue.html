@@ -431,6 +431,7 @@
 
 <script>
 const SUPERVISOR_PIN = '1981';
+
 // ============ API SYNC ============
 let _sse = null;
 let _pollInterval = null;
@@ -442,9 +443,9 @@ async function apiAction(payload) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) toast('❌ Erreur serveur');
+    if (!res.ok) toast("Erreur serveur");
   } catch(e) {
-    toast('❌ Erreur réseau — vérifiez votre connexion');
+    toast("Erreur reseau");
   }
 }
 
@@ -460,19 +461,16 @@ function applyServerState(s) {
 }
 
 function startSSE() {
-  // Close existing
   if (_sse) { try { _sse.close(); } catch(e){} _sse = null; }
   if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
-
   try {
     _sse = new EventSource('/events');
-    _sse.onmessage = e => {
+    _sse.onmessage = function(e) {
       try { applyServerState(JSON.parse(e.data)); } catch(err) {}
     };
-    _sse.onerror = () => {
+    _sse.onerror = function() {
       try { _sse.close(); } catch(e) {}
       _sse = null;
-      // Fallback to polling
       startPolling();
     };
   } catch(e) {
@@ -482,13 +480,575 @@ function startSSE() {
 
 function startPolling() {
   if (_pollInterval) return;
-  _pollInterval = setInterval(async () => {
-    try {
-      const res = await fetch('/state');
-      const s   = await res.json();
+  _pollInterval = setInterval(function() {
+    fetch('/state').then(function(r){ return r.json(); }).then(function(s){
       applyServerState(s);
-    } catch(e) {}
+    }).catch(function(){});
   }, 2000);
 }
 
 // ============ STATE ============
+let state = {
+  role: null, agentName: null,
+  queue: [], serving: [], done: [], financing: [],
+  ticketCounter: 0, closeTarget: null,
+};
+
+let selectedMotif = '';
+let clockInterval = null;
+
+const agentStatus = {};
+const agentTime = {};
+['Jean Marie','Rosette','Lidvine','Jacqueline','Eric','Mathias','Financing 1','Financing 2'].forEach(function(n) {
+  agentStatus[n] = 'disponible';
+  agentTime[n] = { disponible: 0, pause: 0, lastChange: null, loginTime: null };
+});
+
+function toggleDisponibilite() {
+  var name = state.agentName;
+  if (!name) return;
+  var next = (agentStatus[name] || 'disponible') === 'disponible' ? 'pause' : 'disponible';
+  toast(next === 'disponible' ? 'Vous etes disponible' : 'Vous etes en pause');
+  apiAction({ type: 'TOGGLE_STATUS', agentName: name });
+}
+
+// ============ LOGIN ============
+function login(role) {
+  state.role = role;
+  state.agentName = null;
+  document.getElementById('loginPage').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  buildTabs();
+  activateTab(role === 'accueil' ? 'accueil' : role === 'superviseur' ? 'superviseur' : 'agent');
+  document.getElementById('topbarRole').textContent = '— ' + (role === 'accueil' ? 'Accueil' : role === 'superviseur' ? 'Superviseur' : role);
+  startClock();
+  if (role === 'superviseur') startRapportScheduler();
+  startSSE();
+  render();
+}
+
+function showAgentLogin() {
+  document.getElementById('agentLoginOverlay').classList.add('show');
+}
+
+function loginAgent() {
+  var sel = document.getElementById('agentSelect').value;
+  if (!sel) { toast("Selectionnez un agent"); return; }
+  closeOverlay('agentLoginOverlay');
+  state.agentName = sel;
+  state.role = 'agent';
+  apiAction({ type: 'AGENT_LOGIN', agentName: sel });
+  document.getElementById('loginPage').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  buildTabs();
+  activateTab('agent');
+  document.getElementById('topbarRole').textContent = '— ' + sel;
+  startClock();
+  startSSE();
+  render();
+}
+
+function logout() {
+  state.role = null; state.agentName = null;
+  if (_sse) { try { _sse.close(); } catch(e){} _sse = null; }
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
+  document.getElementById('loginPage').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  if (clockInterval) clearInterval(clockInterval);
+}
+
+function buildTabs() {
+  var bar = document.getElementById('tabsBar');
+  bar.innerHTML = '';
+  var tabs = state.role === 'superviseur'
+    ? [{id:'superviseur', label:'Superviseur'}]
+    : state.role === 'agent'
+    ? [{id:'agent', label:'Ma file'}]
+    : [{id:'accueil', label:'Accueil / Enregistrement'}];
+  tabs.forEach(function(t) {
+    var el = document.createElement('div');
+    el.className = 'tab';
+    el.textContent = t.label;
+    el.onclick = function() { activateTab(t.id); };
+    el.id = 'tab-' + t.id;
+    bar.appendChild(el);
+  });
+}
+
+function activateTab(id) {
+  document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+  document.querySelectorAll('.page').forEach(function(p) { p.classList.remove('active'); });
+  var tab = document.getElementById('tab-' + id);
+  if (tab) tab.classList.add('active');
+  var pg = document.getElementById('page-' + id);
+  if (pg) pg.classList.add('active');
+}
+
+function closeOverlay(id) {
+  document.getElementById(id).classList.remove('show');
+}
+
+// ============ PIN ============
+function showPinModal() {
+  ['pin1','pin2','pin3','pin4'].forEach(function(id) { document.getElementById(id).value = ''; });
+  document.getElementById('pinError').textContent = '';
+  document.getElementById('pinOverlay').classList.add('show');
+  setTimeout(function() { document.getElementById('pin1').focus(); }, 100);
+}
+function closePinModal() {
+  document.getElementById('pinOverlay').classList.remove('show');
+}
+function pinNext(el, nextId) {
+  el.value = el.value.replace(/[^0-9]/g,'');
+  if (el.value.length === 1 && nextId) document.getElementById(nextId).focus();
+  if (!nextId && el.value.length === 1) validatePin();
+}
+function pinBack(e, el, prevId) {
+  if (e.key === 'Backspace' && !el.value && prevId) document.getElementById(prevId).focus();
+}
+function validatePin() {
+  var pin = ['pin1','pin2','pin3','pin4'].map(function(id) { return document.getElementById(id).value; }).join('');
+  if (pin.length < 4) { document.getElementById('pinError').textContent = 'Entrez les 4 chiffres'; return; }
+  if (pin === SUPERVISOR_PIN) { closePinModal(); login('superviseur'); }
+  else {
+    document.getElementById('pinError').textContent = 'Code incorrect';
+    ['pin1','pin2','pin3','pin4'].forEach(function(id) { document.getElementById(id).value = ''; });
+    document.getElementById('pin1').focus();
+  }
+}
+
+// ============ CLOCK ============
+function startClock() {
+  if (clockInterval) clearInterval(clockInterval);
+  updateClock();
+  clockInterval = setInterval(updateClock, 1000);
+}
+function updateClock() {
+  var now = new Date();
+  document.getElementById('clock').textContent =
+    now.toLocaleDateString('fr-FR', {weekday:'short', day:'2-digit', month:'short'}) + ' ' +
+    now.toLocaleTimeString('fr-FR', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  render();
+}
+
+// ============ REGISTER ============
+function selectMotif(el, motif) {
+  document.querySelectorAll('.motif-opt').forEach(function(o) { o.classList.remove('selected'); });
+  el.classList.add('selected');
+  selectedMotif = motif;
+  document.getElementById('ticketDisplay').classList.remove('show');
+  document.getElementById('financingBanner').classList.remove('show');
+}
+
+function registerDriver() {
+  var prenom = document.getElementById('inp-prenom').value.trim();
+  var nom    = document.getElementById('inp-nom').value.trim();
+  var type   = document.getElementById('inp-type').value;
+  if (!prenom || !nom) { toast("Entrez le prenom et le nom"); return; }
+  if (!selectedMotif)  { toast("Selectionnez un motif"); return; }
+
+  var previewNum = 'A-' + String(state.ticketCounter + 1).padStart(3, '0');
+
+  if (selectedMotif === 'Financing') {
+    document.getElementById('financingBanner').classList.add('show');
+    document.getElementById('ticketDisplay').classList.remove('show');
+    toast("Dirige vers Financing");
+  } else {
+    document.getElementById('tdNum').textContent   = previewNum;
+    document.getElementById('tdName').textContent  = prenom + ' ' + nom;
+    document.getElementById('tdMotif').textContent = selectedMotif + (type !== 'standard' ? ' · ' + (type === 'vplus' ? 'V+' : 'Client') : '');
+    document.getElementById('ticketDisplay').classList.add('show');
+    document.getElementById('financingBanner').classList.remove('show');
+    toast('Ticket cree pour ' + prenom + ' ' + nom);
+  }
+  apiAction({ type: 'REGISTER', prenom: prenom, nom: nom, driverType: type, motif: selectedMotif });
+
+  document.getElementById('inp-prenom').value = '';
+  document.getElementById('inp-nom').value    = '';
+  document.getElementById('inp-type').value   = 'standard';
+  document.querySelectorAll('.motif-opt').forEach(function(o) { o.classList.remove('selected'); });
+  selectedMotif = '';
+}
+
+// ============ AGENT ACTIONS ============
+function callNext(ticketId) {
+  if ((agentStatus[state.agentName] || 'disponible') === 'pause') {
+    toast("Reprenez votre service avant d'appeler"); return;
+  }
+  var myActive = state.serving.find(function(t) { return t.agent === state.agentName; });
+  if (myActive) { toast("Cloturez votre cas en cours"); return; }
+  var available = ticketId
+    ? state.queue.find(function(t) { return t.id === ticketId; })
+    : state.queue.find(function(t) { return canHandle(state.agentName, t.motif); });
+  if (!available) { toast("Aucun cas disponible"); return; }
+  toast('Vous prenez en charge ' + available.fullName);
+  apiAction({ type: 'CALL_NEXT', agentName: state.agentName, ticketId: available.id });
+}
+
+function canHandle(agentName, motif) {
+  var scope = AGENTS[agentName];
+  return scope ? scope.scope.includes(motif) : false;
+}
+
+function openCloseModal(ticketId) {
+  var ticket = state.serving.find(function(t) { return t.id === ticketId; });
+  if (!ticket) return;
+  state.closeTarget = ticketId;
+  document.getElementById('closeModalTitle').textContent = 'Cloturer — ' + ticket.fullName;
+  document.getElementById('closeModalSub').textContent   = ticket.motif + ' · ' + ticket.num;
+  document.getElementById('closeNote').value = '';
+  document.getElementById('closeModal').classList.add('show');
+}
+
+function confirmClose() {
+  var ticket = state.serving.find(function(t) { return t.id === state.closeTarget; });
+  if (!ticket) return;
+  var note = document.getElementById('closeNote').value;
+  closeOverlay('closeModal');
+  toast('Cas cloture — ' + ticket.fullName);
+  apiAction({ type: 'CLOSE', ticketId: state.closeTarget, note: note });
+  state.closeTarget = null;
+}
+
+// ============ AGENTS CONFIG ============
+var AGENTS = {
+  "Jean Marie":  { scope: ["Demande d'infos","Reclamation","Probleme App","Convocation disciplinaire","Formation","Fleet info","Sensibilisation","Droit taxi"], av:"JM", col:"av-b" },
+  "Rosette":     { scope: ["Demande d'infos","Reclamation","Probleme App","Convocation disciplinaire","Formation","Sensibilisation"], av:"RO", col:"av-g" },
+  "Lidvine":     { scope: ["Demande d'infos","Reclamation","Probleme App","Convocation disciplinaire","Formation","Sensibilisation"], av:"LI", col:"av-g" },
+  "Jacqueline":  { scope: ["Demande d'infos","Reclamation","Probleme App","Convocation disciplinaire","Formation","Sensibilisation"], av:"JA", col:"av-g" },
+  "Eric":        { scope: ["Demande d'infos","Reclamation","Probleme App","Convocation disciplinaire","Formation","Sensibilisation"], av:"ER", col:"av-g" },
+  "Mathias":     { scope: ["Droit taxi"], av:"MA", col:"av-w" },
+  "Financing 1": { scope: ["Financing"], av:"F1", col:"av-p" },
+  "Financing 2": { scope: ["Financing"], av:"F2", col:"av-p" },
+};
+
+// ============ HELPERS ============
+function elapsed(ms) {
+  var m = Math.floor(ms / 60000), s = Math.floor((ms % 60000) / 1000);
+  return m > 0 ? m + 'min ' + s + 's' : s + 's';
+}
+function avgTime(agentName) {
+  var done = state.done.filter(function(t) { return t.agent === agentName && t.endTime && t.startServeTime; });
+  if (!done.length) return null;
+  return Math.round(done.reduce(function(s,t) { return s + (t.endTime - t.startServeTime); }, 0) / done.length / 1000);
+}
+function formatAvg(secs) {
+  if (secs === null) return '—';
+  return secs >= 60 ? Math.floor(secs/60) + 'min ' + (secs%60) + 's' : secs + 's';
+}
+function fmtMs(ms) {
+  if (!ms || ms < 0) return '0min';
+  var h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+  return h > 0 ? h + 'h' + String(m).padStart(2,'0') : m + 'min';
+}
+function typeBadge(type) {
+  if (type === 'vplus')  return '<span class="badge badge-vplus">V+</span>';
+  if (type === 'client') return '<span class="badge badge-client">Client</span>';
+  return '<span class="badge badge-standard">Standard</span>';
+}
+function motifColor(motif) {
+  if (motif === 'Droit taxi') return 'color:var(--amber-dark);font-weight:600;';
+  if (motif === 'Fleet info') return 'color:var(--blue);font-weight:600;';
+  if (motif === 'Convocation disciplinaire') return 'color:var(--red);font-weight:600;';
+  return '';
+}
+function toast(msg) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(function() { el.classList.remove('show'); }, 2800);
+}
+function avatarEl(name) {
+  var a = AGENTS[name] || { av: (name||'?').substring(0,2).toUpperCase(), col:'av-g' };
+  return '<span class="avatar ' + a.col + '">' + a.av + '</span>';
+}
+function getAgentTimeSummary(name) {
+  var t = agentTime[name];
+  if (!t || !t.loginTime) return null;
+  var now = Date.now();
+  var current = agentStatus[name] || 'disponible';
+  var extra = t.lastChange ? now - t.lastChange : 0;
+  var disp  = t.disponible + (current === 'disponible' ? extra : 0);
+  var pause = t.pause      + (current === 'pause'      ? extra : 0);
+  var treating = state.done.filter(function(d) { return d.agent === name && d.startServeTime && d.endTime; })
+    .reduce(function(s,d) { return s + (d.endTime - d.startServeTime); }, 0);
+  return { disp: disp, pause: pause, treating: treating, total: now - t.loginTime };
+}
+
+// ============ RENDER ============
+function render() {
+  if (state.role === 'accueil')     renderAccueil();
+  if (state.role === 'agent')       renderAgent();
+  if (state.role === 'superviseur') renderSuperviseur();
+}
+
+function renderAccueil() {
+  var q = state.queue.concat(state.serving);
+  var el = document.getElementById('accueilQueue');
+  var countEl = document.getElementById('accueilQueueCount');
+  if (countEl) countEl.textContent = state.queue.length + ' en attente · ' + state.serving.length + ' en cours';
+  if (!q.length) { el.innerHTML = '<div class="empty"><div class="empty-icon">📋</div>Aucun conducteur en file</div>'; return; }
+  el.innerHTML = q.map(function(t) {
+    var mins = Math.floor((Date.now() - t.arrivalTime) / 60000);
+    var late = mins >= 30 && t.status === 'waiting';
+    var cls  = t.status === 'serving' ? 'serving' : (t.type !== 'standard' ? 'priority' : '') + (late ? ' late' : '');
+    return '<div class="queue-item ' + cls + '">' +
+      '<div class="ticket-num">' + t.num + '</div>' +
+      '<div class="ticket-info"><div class="ticket-name">' + t.fullName + ' ' + typeBadge(t.type) + '</div>' +
+      '<div class="ticket-meta" style="' + motifColor(t.motif) + '">' + t.motif + (t.agent ? ' · 👤 ' + t.agent : '') + '</div></div>' +
+      '<div class="ticket-time' + (late?' late':'') + '">' + mins + 'min' + (late?' ⚠️':'') + '</div></div>';
+  }).join('');
+}
+
+function renderAgent() {
+  var myQueue   = state.queue.filter(function(t)   { return canHandle(state.agentName, t.motif); });
+  var myServing = state.serving.filter(function(t) { return t.agent === state.agentName; });
+  var myDone    = state.done.filter(function(t)    { return t.agent === state.agentName; });
+  var avg       = avgTime(state.agentName);
+  var myStatus  = agentStatus[state.agentName] || 'disponible';
+  var isDisp    = myStatus === 'disponible';
+
+  // Status bar
+  var badgeEl = document.getElementById('agentStatusBadge');
+  var btnEl   = document.getElementById('toggleBtn');
+  if (badgeEl) badgeEl.innerHTML = isDisp
+    ? '<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--green-dark);background:var(--green-light);padding:5px 12px;border-radius:20px;">🟢 Disponible</span>'
+    : '<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--amber-dark);background:var(--amber-light);padding:5px 12px;border-radius:20px;">⏸ En pause</span>';
+  if (btnEl) {
+    btnEl.textContent = isDisp ? 'Prendre une pause' : 'Reprendre';
+    btnEl.style.background = isDisp ? 'var(--amber-light)' : 'var(--green-light)';
+    btnEl.style.color      = isDisp ? 'var(--amber-dark)'  : 'var(--green-dark)';
+    btnEl.style.border     = '1px solid ' + (isDisp ? 'var(--amber)' : 'var(--green)');
+  }
+
+  // Stats
+  var statsEl = document.getElementById('agentStats');
+  if (statsEl) statsEl.innerHTML =
+    '<div class="stat stat-blue"><div class="stat-val">' + myQueue.length   + '</div><div class="stat-lbl">En attente</div></div>' +
+    '<div class="stat stat-green"><div class="stat-val">' + myServing.length + '</div><div class="stat-lbl">En cours</div></div>' +
+    '<div class="stat"><div class="stat-val">'            + myDone.length   + '</div><div class="stat-lbl">Traites</div></div>' +
+    '<div class="stat stat-amber"><div class="stat-val">' + formatAvg(avg)  + '</div><div class="stat-lbl">Temps moyen</div></div>';
+
+  // Alerts
+  var lates   = myQueue.filter(function(t) { return Math.floor((Date.now()-t.arrivalTime)/60000) >= 30; });
+  var alertEl = document.getElementById('agentAlerts');
+  if (alertEl) alertEl.innerHTML = lates.map(function(t) {
+    return '<div class="alert alert-red">⚠️ ' + t.fullName + ' attend depuis ' + Math.floor((Date.now()-t.arrivalTime)/60000) + ' min — ' + t.motif + '</div>';
+  }).join('');
+
+  // Queue
+  var qEl      = document.getElementById('agentQueue');
+  var qCountEl = document.getElementById('agentQueueCount');
+  if (qCountEl) qCountEl.textContent = myQueue.length + ' cas';
+  if (!myQueue.length) { qEl.innerHTML = '<div class="empty"><div class="empty-icon">✅</div>Aucun cas en attente</div>'; }
+  else {
+    var hasActive = myServing.length > 0;
+    qEl.innerHTML = '';
+    myQueue.forEach(function(t) {
+      var mins = Math.floor((Date.now()-t.arrivalTime)/60000);
+      var late = mins >= 30;
+      var div  = document.createElement('div');
+      div.className = 'queue-item' + (t.type!=='standard'?' priority':'') + (late?' late':'');
+      var inner = document.createElement('div'); inner.className='ticket-num'; inner.textContent=t.num;
+      div.appendChild(inner);
+      var info = document.createElement('div'); info.className='ticket-info';
+      info.innerHTML = '<div class="ticket-name">' + t.fullName + ' ' + typeBadge(t.type) + '</div>' +
+        '<div class="ticket-meta" style="' + motifColor(t.motif) + '">' + t.motif + '</div>';
+      div.appendChild(info);
+      var timeDiv = document.createElement('div');
+      timeDiv.className = 'ticket-time' + (late?' late':'');
+      timeDiv.textContent = mins + 'min' + (late?' ⚠️':'');
+      div.appendChild(timeDiv);
+      var actions = document.createElement('div'); actions.className='ticket-actions';
+      var btn = document.createElement('button');
+      btn.className='btn btn-sm btn-success'; btn.textContent='Appeler';
+      if (hasActive) { btn.disabled=true; btn.style.opacity='0.4'; }
+      (function(id){ btn.onclick=function(){ callNext(id); }; })(t.id);
+      actions.appendChild(btn); div.appendChild(actions);
+      qEl.appendChild(div);
+    });
+  }
+
+  // Active case
+  var aEl = document.getElementById('agentActiveCase');
+  if (!myServing.length) { aEl.innerHTML = '<div class="empty" style="padding:16px;">Aucun cas en cours</div>'; }
+  else {
+    aEl.innerHTML = '';
+    myServing.forEach(function(t) {
+      var dur = t.startServeTime ? elapsed(Date.now()-t.startServeTime) : '--';
+      var div = document.createElement('div'); div.className='queue-item serving';
+      var numDiv = document.createElement('div'); numDiv.className='ticket-num'; numDiv.textContent=t.num;
+      div.appendChild(numDiv);
+      var info = document.createElement('div'); info.className='ticket-info';
+      info.innerHTML = '<div class="ticket-name">' + t.fullName + ' ' + typeBadge(t.type) + '</div>' +
+        '<div class="ticket-meta" style="' + motifColor(t.motif) + '">' + t.motif + ' · ⏱ ' + dur + '</div>';
+      div.appendChild(info);
+      var actions = document.createElement('div'); actions.className='ticket-actions';
+      var btn = document.createElement('button');
+      btn.className='btn btn-sm btn-danger'; btn.textContent='Cloturer';
+      (function(id){ btn.onclick=function(){ openCloseModal(id); }; })(t.id);
+      actions.appendChild(btn); div.appendChild(actions);
+      aEl.appendChild(div);
+    });
+  }
+
+  // Done list
+  var dEl      = document.getElementById('agentDoneList');
+  var dCountEl = document.getElementById('agentDoneCount');
+  if (dCountEl) dCountEl.textContent = myDone.length + ' cas';
+  if (!myDone.length) { dEl.innerHTML = '<div class="empty" style="padding:16px;">Aucun cas cloture</div>'; return; }
+  dEl.innerHTML = myDone.slice(0,8).map(function(t) {
+    var dur = t.endTime && t.startServeTime ? elapsed(t.endTime-t.startServeTime) : '—';
+    return '<div class="queue-item" style="opacity:0.75;">' +
+      '<div class="ticket-num" style="font-size:14px;color:var(--text-3);">' + t.num + '</div>' +
+      '<div class="ticket-info"><div class="ticket-name" style="font-size:13px;">' + t.fullName + '</div>' +
+      '<div class="ticket-meta">' + t.motif + ' · ⏱ ' + dur + (t.note?' · '+t.note:'') + '</div></div>' +
+      '<span class="badge badge-done">Cloture</span></div>';
+  }).join('');
+}
+
+function renderSuperviseur() {
+  var totalWaiting = state.queue.length;
+  var totalServing = state.serving.length;
+  var totalDone    = state.done.length;
+  var lates        = state.queue.filter(function(t) { return Math.floor((Date.now()-t.arrivalTime)/60000) >= 30; });
+
+  var statsEl = document.getElementById('supStats');
+  if (statsEl) statsEl.innerHTML =
+    '<div class="stat stat-blue"><div class="stat-val">' + totalWaiting + '</div><div class="stat-lbl">En attente</div></div>' +
+    '<div class="stat stat-green"><div class="stat-val">' + totalServing + '</div><div class="stat-lbl">En cours</div></div>' +
+    '<div class="stat"><div class="stat-val">'            + totalDone    + '</div><div class="stat-lbl">Traites</div></div>' +
+    '<div class="stat stat-red"><div class="stat-val">'  + lates.length + '</div><div class="stat-lbl">En retard +30min</div></div>';
+
+  var aEl = document.getElementById('supAlerts');
+  if (aEl) aEl.innerHTML = lates.length
+    ? lates.map(function(t) { return '<div class="alert alert-red">⚠️ <strong>' + t.fullName + '</strong> — ' + t.motif + ' — ' + Math.floor((Date.now()-t.arrivalTime)/60000) + ' min (' + t.num + ')</div>'; }).join('')
+    : '<div class="alert alert-green">✅ Aucun cas en retard</div>';
+
+  var all  = state.queue.concat(state.serving);
+  var qEl  = document.getElementById('supQueue');
+  var qcEl = document.getElementById('supQueueCount');
+  if (qcEl) qcEl.textContent = all.length + ' tickets actifs';
+  if (!all.length) { qEl.innerHTML = '<div class="empty"><div class="empty-icon">📋</div>File vide</div>'; }
+  else {
+    qEl.innerHTML = all.map(function(t) {
+      var mins = Math.floor((Date.now()-t.arrivalTime)/60000);
+      var late = mins >= 30 && t.status === 'waiting';
+      return '<div class="queue-item ' + (t.status==='serving'?'serving':(t.type!=='standard'?'priority':'')+(late?' late':'')) + '">' +
+        '<div class="ticket-num">' + t.num + '</div>' +
+        '<div class="ticket-info"><div class="ticket-name">' + t.fullName + ' ' + typeBadge(t.type) + '</div>' +
+        '<div class="ticket-meta" style="' + motifColor(t.motif) + '">' + t.motif + (t.agent?' · 👤 '+t.agent:'') + '</div></div>' +
+        '<div class="ticket-time' + (late?' late':'') + '">' + mins + 'min' + (late?' ⚠️':'') + '</div>' +
+        '<span class="badge ' + (t.status==='serving'?'badge-serving':'badge-waiting') + '">' + (t.status==='serving'?'En cours':'Attente') + '</span></div>';
+    }).join('');
+  }
+
+  var agentNames = ['Jean Marie','Rosette','Lidvine','Jacqueline','Eric','Mathias'];
+  var perf = agentNames.map(function(name) {
+    var done = state.done.filter(function(t) { return t.agent === name; });
+    return { name: name, done: done.length, avg: avgTime(name), active: state.serving.filter(function(t) { return t.agent === name; }).length };
+  }).sort(function(a,b) { return b.done - a.done || (a.avg||999) - (b.avg||999); });
+
+  var maxDone = Math.max.apply(null, perf.map(function(p) { return p.done; }).concat([1]));
+  var perfEl  = document.getElementById('perfBody');
+  if (perfEl) perfEl.innerHTML = perf.map(function(p,i) {
+    var pct    = Math.round((p.done/maxDone)*100);
+    var status = p.active > 0 ? '<span class="badge badge-serving">En cours</span>'
+      : (agentStatus[p.name]||'disponible') === 'pause' ? '<span class="badge badge-vplus">⏸ Pause</span>'
+      : '<span style="color:var(--green);font-weight:600;">🟢</span>';
+    return '<tr><td class="' + (i===0?'rank-1':i===1?'rank-2':i===2?'rank-3':'') + '">' + (i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1) + '</td>' +
+      '<td><span class="av-name">' + avatarEl(p.name) + ' ' + p.name + '</span></td>' +
+      '<td>' + p.done + ' <div class="bar-wrap"><div class="bar-fill" style="width:' + pct + '%"></div></div></td>' +
+      '<td>' + formatAvg(p.avg) + '</td><td>' + status + '</td></tr>';
+  }).join('');
+
+  // Time grid
+  var timeDiv = document.getElementById('agentTimeGrid');
+  if (timeDiv) timeDiv.innerHTML = agentNames.map(function(name) {
+    var ts = getAgentTimeSummary(name);
+    if (!ts) return '<div class="stat"><div style="font-size:12px;font-weight:600;margin-bottom:6px;">' + name + '</div><div style="font-size:11px;color:var(--text-3);">Pas connecte</div></div>';
+    return '<div class="stat"><div style="font-size:12px;font-weight:600;margin-bottom:6px;">' + name + '</div>' +
+      '<div style="font-size:12px;color:var(--green-dark);margin-bottom:2px;">🟢 ' + fmtMs(ts.disp) + '</div>' +
+      '<div style="font-size:12px;color:var(--amber-dark);margin-bottom:2px;">⏸ ' + fmtMs(ts.pause) + '</div>' +
+      '<div style="font-size:12px;color:var(--blue);">🔵 ' + fmtMs(ts.treating) + '</div></div>';
+  }).join('');
+
+  // History
+  var hEl     = document.getElementById('supHistory');
+  var allDone = state.done.concat(state.financing).sort(function(a,b) { return (b.endTime||b.arrivalTime)-(a.endTime||a.arrivalTime); });
+  if (!allDone.length) { hEl.innerHTML = '<div class="empty" style="padding:16px;">Aucun cas cloture</div>'; return; }
+  hEl.innerHTML = allDone.slice(0,15).map(function(t) {
+    var dur = t.endTime && t.startServeTime ? elapsed(t.endTime-t.startServeTime) : '—';
+    return '<div class="queue-item" style="opacity:0.8;">' +
+      '<div class="ticket-num" style="font-size:13px;color:var(--text-3);">' + t.num + '</div>' +
+      '<div class="ticket-info"><div class="ticket-name" style="font-size:13px;">' + t.fullName + ' ' + typeBadge(t.type) + '</div>' +
+      '<div class="ticket-meta">' + t.motif + (t.agent?' · 👤 '+t.agent:'') + (dur!=='—'?' · ⏱ '+dur:'') + '</div></div>' +
+      '<span class="badge ' + (t.status==='financing'?'badge-financing':'badge-done') + '">' + (t.status==='financing'?'Financing':'Cloture') + '</span></div>';
+  }).join('');
+}
+
+// ============ RAPPORT GOOGLE CHAT ============
+var WEBHOOK_URL = 'https://chat.googleapis.com/v1/spaces/AAQAmvphdRA/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=1_WJC7PXJJ90uPqn77Kuq5tMq3YUkslblRYdrZd3ODc';
+var RAPPORT_HEURE = 19;
+var rapportEnvoye = false;
+var rapportScheduler = null;
+
+function buildRapportText() {
+  var now     = new Date();
+  var dateStr = now.toLocaleDateString('fr-FR', { weekday:'long', day:'2-digit', month:'long', year:'numeric' });
+  var totalDone      = state.done.length;
+  var totalFinancing = state.financing.length;
+  var byMotif = {};
+  state.done.forEach(function(t) { byMotif[t.motif] = (byMotif[t.motif]||0)+1; });
+  if (totalFinancing > 0) byMotif['Financing'] = totalFinancing;
+  var motifLines = Object.entries(byMotif).sort(function(a,b){return b[1]-a[1];}).map(function(e){ return "   • " + e[0] + " : " + e[1] + " cas"; }).join("\n");
+  var agentNames = ['Jean Marie','Rosette','Lidvine','Jacqueline','Eric','Mathias'];
+  var perf = agentNames.map(function(name) {
+    return { name:name, done:state.done.filter(function(t){return t.agent===name;}).length, avg:avgTime(name) };
+  }).filter(function(p){return p.done>0;}).sort(function(a,b){return b.done-a.done;});
+  var perfLines = perf.map(function(p,i) {
+    var medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':'  ';
+    var ts = getAgentTimeSummary(p.name);
+    var timeDetail = ts ? ' | 🟢 '+fmtMs(ts.disp)+' · ⏸ '+fmtMs(ts.pause)+' · 🔵 '+fmtMs(ts.treating) : '';
+    return '   ' + medal + ' ' + p.name + ' : ' + p.done + ' cas — ' + formatAvg(p.avg) + timeDetail;
+  }).join("\n");
+  var sep = Array(41).join("-");
+  return "📊 *RAPPORT JOURNALIER — FILE D'ATTENTE*\n📅 " + dateStr + "\n" + sep +
+    "\n\n*RÉSUMÉ*\n   🎫 Total : " + (totalDone+totalFinancing) +
+    "\n   ✅ File : " + totalDone + "\n   💜 Financing : " + totalFinancing +
+    "\n\n*MOTIFS*\n" + (motifLines||"   Aucun") +
+    "\n\n*AGENTS*\n" + (perfLines||"   Aucune donnee") +
+    "\n\n" + sep + "\n_Rapport " + now.toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"}) + " — Gozem Queue_";
+}
+
+function updateRapportStatus(status) {
+  var el = document.getElementById('rapportStatus');
+  if (!el) return;
+  if (status === 'sent')    el.innerHTML = '<div class="alert alert-green">✅ Rapport envoye sur Google Chat a ' + new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}) + '</div>';
+  else if (status === 'pending') el.innerHTML = '<div class="alert alert-amber">⏱ Rapport automatique a 19h00 — <button class="btn btn-sm btn-outline" onclick="envoyerRapport(true)" style="margin-left:8px;">Envoyer maintenant</button></div>';
+  else el.innerHTML = '<div class="alert alert-red">❌ Echec envoi — <button class="btn btn-sm btn-outline" onclick="envoyerRapport(true)" style="margin-left:8px;">Reessayer</button></div>';
+}
+
+function envoyerRapport(manuel) {
+  if (!manuel && rapportEnvoye) return;
+  var texte = buildRapportText();
+  fetch(WEBHOOK_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:texte}) })
+    .then(function(res) {
+      if (res.ok) { rapportEnvoye = true; toast('✅ Rapport envoye'); updateRapportStatus('sent'); }
+      else { toast('❌ Erreur envoi'); updateRapportStatus('error'); }
+    }).catch(function() { toast('❌ Erreur reseau'); updateRapportStatus('error'); });
+}
+
+function startRapportScheduler() {
+  if (rapportScheduler) clearInterval(rapportScheduler);
+  updateRapportStatus('pending');
+  rapportScheduler = setInterval(function() {
+    var now = new Date();
+    if (now.getHours() === RAPPORT_HEURE && now.getMinutes() === 0 && !rapportEnvoye) envoyerRapport(false);
+    if (!rapportEnvoye) updateRapportStatus('pending');
+  }, 30000);
+}
+
+</script>
+</body>
+</html>
