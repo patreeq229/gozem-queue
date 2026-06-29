@@ -442,23 +442,27 @@ async function apiAction(payload) {
   } catch(e) { toast('❌ Erreur réseau'); }
 }
 
+let _sse = null;
 function startSSE() {
-  const es = new EventSource('/events');
-  es.addEventListener('state', e => {
-    const s = JSON.parse(e.data);
-    state.queue      = s.queue      || [];
-    state.serving    = s.serving    || [];
-    state.done       = s.done       || [];
-    state.financing  = s.financing  || [];
-    state.ticketCounter = s.ticketCounter || 0;
-    // sync agentStatus & agentTime
-    Object.assign(agentStatus, s.agentStatus || {});
-    Object.assign(agentTime,   s.agentTime   || {});
-    render();
+  if (_sse) { _sse.close(); _sse = null; }
+  _sse = new EventSource('/events');
+  _sse.addEventListener('state', e => {
+    try {
+      const s = JSON.parse(e.data);
+      state.queue         = s.queue      || [];
+      state.serving       = s.serving    || [];
+      state.done          = s.done       || [];
+      state.financing     = s.financing  || [];
+      state.ticketCounter = s.ticketCounter || 0;
+      Object.assign(agentStatus, s.agentStatus || {});
+      Object.assign(agentTime,   s.agentTime   || {});
+      render();
+    } catch(err) { console.error('SSE parse error', err); }
   });
-  es.onerror = () => {
-    setTimeout(startSSE, 3000); // reconnect
-    es.close();
+  _sse.onerror = () => {
+    _sse.close();
+    _sse = null;
+    setTimeout(startSSE, 3000);
   };
 }
 
@@ -604,6 +608,7 @@ function loginAgent() {
   activateTab('agent');
   document.getElementById('topbarRole').textContent = '— ' + sel;
   startClock();
+  startSSE();
   render();
 }
 
